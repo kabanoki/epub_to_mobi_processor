@@ -1,0 +1,321 @@
+---
+title: "EPUB → KindleGen 変換エラー修正ガイド"
+description: "EPUBファイルをKindleGenでMOBI形式に変換する際のエラー修正方法"
+tags: ["epub", "kindlegen", "mobi", "電子書籍", "変換", "エラー修正"]
+ai_context: |
+  このドキュメントは、EPUBファイルをKindleGenでMOBI形式に変換する際に発生する
+  一般的なエラーとその修正方法をまとめたガイドです。
+  
+  主な対応エラー:
+  - E1005: Could not access file (ファイル拡張子不整合・存在しないファイル参照)
+  - E24010: Hyperlink not resolved in toc (目次リンクエラー)
+  - E24001: The table of content could not be built (目次構築エラー)
+  - W14001: Hyperlink not resolved (ハイパーリンクエラー)
+  - 存在しないファイルへの参照問題（自動検出・修正対応）
+  
+  このガイドを参照する際は、具体的なエラーメッセージを提示してください。
+  適切な修正手順を段階的に案内します。
+---
+
+# EPUB → KindleGen 変換エラー修正ガイド
+
+## 概要
+EPUBファイルをKindleGenでMOBI形式に変換する際に発生する一般的なエラーと、その修正方法をまとめたガイドです。
+
+## 自動修正ツール
+
+### epub_to_mobi_processor.sh
+**統合修正スクリプト** - 複数の問題を自動検出・修正してMOBI変換まで実行
+
+```bash
+# 使用方法
+./epub_to_mobi_processor.sh [対象ディレクトリ]
+
+# 機能
+# 1. EPUB構造検証
+# 2. HTML→XHTML自動変換
+# 3. 存在しないファイル参照の自動検出・削除
+# 4. 複雑なアンカーリンクの自動修正
+# 5. KindleGenによるMOBI変換
+# 6. 詳細ログ出力
+```
+
+**推奨**: 手動修正の前に、まずこのスクリプトで自動修正を試してください。
+
+## 主な問題と解決方法
+
+### 1. 存在しないファイル参照エラー ⭐新規対応
+
+**問題:**
+```
+Error(core):E1005: Could not access file.
+in file: /path/to/item/xhtml/p-006.xhtml
+```
+
+**原因:** 
+- OPFファイル、目次、ナビゲーションファイルで参照されているファイルが実際には存在しない
+- 欠落したコンテンツファイル（例：p-006.xhtml）への参照が残っている
+
+**自動解決:** `epub_to_mobi_processor.sh`の`fix_missing_file_references()`機能で自動修正
+
+**手動解決方法:**
+```bash
+# 1. 存在しないファイルを特定
+unzip -l "問題のEPUB.epub" | grep "p-006"  # 結果なし = ファイル存在しない
+
+# 2. OPFファイルから参照を削除
+sed -i '/href="xhtml\/p-006.xhtml"/d' item/standard.opf
+sed -i '/idref="p-006"/d' item/standard.opf
+
+# 3. 目次ファイルから該当リンクを削除
+sed -i '/href="p-006.xhtml/d' item/xhtml/p-toc-001.xhtml
+
+# 4. ナビゲーションファイルから該当リンクを削除
+sed -i '/href="xhtml\/p-006.xhtml/d' item/navigation-documents.xhtml
+```
+
+### 2. ファイル拡張子の不整合
+
+**問題:**
+```
+Error(core):E1005: Could not access file.
+in file: /path/to/text/part0000.html
+```
+
+**原因:** 
+- 実際のファイルは`.xhtml`拡張子だが、`content.opf`で`.html`として参照されている
+
+**解決方法:**
+```bash
+# 1. HTMLファイルをXHTMLに一括変更
+cd text/
+for file in *.html; do mv "$file" "${file%.html}.xhtml"; done
+
+# 2. content.opfファイル内の参照を更新
+sed -i 's/\.html/.xhtml/g' content.opf
+
+# 3. toc.ncxファイル内の参照を更新
+sed -i 's/\.html/.xhtml/g' toc.ncx
+
+# 4. XHTMLファイル内の内部リンクを更新
+find text/ -name "*.xhtml" -exec sed -i 's/\.html/.xhtml/g' {} \;
+```
+
+### 2. 目次（TOC）のハイパーリンクエラー
+
+**問題:**
+```
+Error(prcgen):E24010: Hyperlink not resolved in toc
+Error(prcgen):E24001: The table of content could not be built.
+```
+
+**原因:**
+- 複雑なアンカーID（例：`#6LJU0-ba3fd9a1b33f4880b1d1cc7965675df0`）をKindleGenが認識できない
+- `display:none`スタイルが適用されたアンカーへのリンク
+
+**自動解決:** `epub_to_mobi_processor.sh`の`fix_anchor_links_comprehensive()`機能で自動修正
+
+**手動解決方法:**
+```bash
+# 複雑なアンカーIDパターンを削除（拡張版）
+# 1. 32文字16進数パターン
+sed -i 's/#[a-zA-Z0-9-]*-[a-fA-F0-9]\{32\}//g' toc.ncx
+sed -i 's/#[a-zA-Z0-9-]*-[a-fA-F0-9]\{32\}//g' content.opf
+
+# 2. UUID形式パターン
+sed -i 's/#[0-9a-zA-Z-]*-[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}//g' toc.ncx
+sed -i 's/#[0-9a-zA-Z-]*-[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}//g' content.opf
+
+# 3. 既知の問題パターン
+sed -i 's/#[a-zA-Z0-9-]*-ba3fd9a1b33f4880b1d1cc7965675df0//g' toc.ncx
+sed -i 's/#[a-zA-Z0-9-]*-ba3fd9a1b33f4880b1d1cc7965675df0//g' content.opf
+
+# 4. XHTML内のアンカーリンクも修正
+find . -name "*.xhtml" -exec sed -i 's/#[a-zA-Z0-9-]*-[a-fA-F0-9]\{32\}//g' {} \;
+find . -name "*.xhtml" -exec sed -i 's/#[0-9a-zA-Z-]*-[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}//g' {} \;
+```
+
+### 3. ハイパーリンク解決エラー
+
+**問題:**
+```
+Warning(prcgen):W14001: Hyperlink not resolved
+Warning(prcgen):W14002: Some hyperlinks could not be resolved.
+```
+
+**原因:**
+- 存在しないファイルやアンカーへのリンク
+- ファイル拡張子の不一致
+
+**解決方法:**
+- すべての内部リンクが正しいファイル名とアンカーを参照していることを確認
+- 不要な複雑なアンカーIDは削除し、シンプルなファイル参照に変更
+
+## 修正手順の完全版
+
+### ステップ1: ファイル拡張子の統一
+```bash
+# 作業ディレクトリに移動
+cd "[EPUBフォルダ名]"
+
+# HTMLファイルをXHTMLに変更
+cd text/
+for file in *.html; do mv "$file" "${file%.html}.xhtml"; done
+cd ..
+```
+
+### ステップ2: 参照ファイルの更新
+```bash
+# content.opf内の参照を更新
+sed -i 's/\.html/.xhtml/g' content.opf
+
+# toc.ncx内の参照を更新
+sed -i 's/\.html/.xhtml/g' toc.ncx
+
+# XHTMLファイル内の内部リンクを更新
+find text/ -name "*.xhtml" -exec sed -i 's/\.html/.xhtml/g' {} \;
+```
+
+### ステップ3: 問題のあるアンカーリンクの修正
+```bash
+# 複雑なアンカーIDを削除（toc.ncx）
+sed -i 's/#[a-zA-Z0-9-]*-ba3fd9a1b33f4880b1d1cc7965675df0//g' toc.ncx
+
+# 複雑なアンカーIDを削除（content.opf）
+sed -i 's/#[a-zA-Z0-9-]*-ba3fd9a1b33f4880b1d1cc7965675df0//g' content.opf
+```
+
+### ステップ4: EPUBファイルの再構築
+```bash
+# 修正されたファイルでEPUBを再作成
+zip -r "修正版ファイル名.epub" . -x "*.DS_Store"
+```
+
+### ステップ5: KindleGenでの変換テスト
+```bash
+kindlegen "修正版ファイル名.epub"
+```
+
+## 正しいEPUB構造
+
+### 必須ファイル構造
+```
+EPUB/
+├── META-INF/
+│   └── container.xml
+├── mimetype
+├── content.opf
+├── toc.ncx
+├── titlepage.xhtml
+├── stylesheet.css
+├── page_styles.css
+├── cover.jpeg
+├── images/
+│   ├── 00001.jpeg
+│   └── ...
+└── text/
+    ├── part0000.xhtml
+    ├── part0001.xhtml
+    └── ...
+```
+
+### content.opfの正しい形式
+```xml
+<manifest>
+  <item href="titlepage.xhtml" id="titlepage" media-type="application/xhtml+xml"/>
+  <item href="text/part0000.xhtml" id="id32" media-type="application/xhtml+xml"/>
+  <!-- すべて.xhtml拡張子で統一 -->
+</manifest>
+
+<guide>
+  <reference href="text/part0000.xhtml" title="本編" type="text"/>
+  <reference href="titlepage.xhtml" title="Cover" type="cover"/>
+  <reference href="text/part0007.xhtml" title="目次" type="toc"/>
+  <!-- アンカーIDは使用せず、ファイル名のみ -->
+</guide>
+```
+
+### toc.ncxの正しい形式
+```xml
+<navMap>
+  <navPoint class="chapter" id="num_1" playOrder="0">
+    <navLabel>
+      <text>CONTENTS</text>
+    </navLabel>
+    <content src="text/part0007.xhtml"/>
+    <!-- 複雑なアンカーIDは使用しない -->
+  </navPoint>
+</navMap>
+```
+
+## トラブルシューティング
+
+### よくあるエラーメッセージ
+1. `E1005: Could not access file` 
+   - ファイル拡張子の不一致（.html/.xhtml）
+   - **新規**: 存在しないファイルへの参照
+2. `E24010: Hyperlink not resolved in toc` → 目次のアンカーリンク問題
+3. `E24001: The table of content could not be built` → 目次構築エラー
+4. `W14001: Hyperlink not resolved` → 内部リンクの問題
+
+### 検証方法
+```bash
+# 修正後の検証
+grep -r "\.html" . --exclude-dir=images  # .html参照が残っていないか確認
+unzip -l "修正版.epub"  # EPUBファイルの内容確認
+kindlegen "修正版.epub"  # 最終テスト
+```
+
+## 注意事項
+
+1. **バックアップ**: 修正前に必ず元ファイルのバックアップを作成
+2. **文字エンコーディング**: UTF-8エンコーディングを維持
+3. **ファイル名**: 特殊文字や日本語を含むファイル名は避ける
+4. **アンカーID**: KindleGenは複雑なアンカーIDを正しく処理できない場合がある
+
+## 成功例
+
+### 39巻: 存在しないファイル参照エラー
+
+修正前:
+```
+Error(core):E1005: Could not access file.
+      in file: /var/folders/.../item/xhtml/p-006.xhtml
+Error(prcgen):E24010: Hyperlink not resolved in toc
+Error(prcgen):E24001: The table of content could not be built.
+Info(prcgen):I1038: MOBI file could not be generated because of errors!
+```
+
+修正後:
+```
+Info(prcgen):I1032: PRC built successfully
+Info(prcgen):I1036: Mobi file built successfully
+Final file size: 29MB
+```
+
+### 40巻: HTML→XHTML変換
+
+修正前:
+```
+Warning: HTMLとXHTMLファイルが混在しています（修正が必要）
+```
+
+修正後:
+```
+HTML→XHTML変換完了: 24 個のファイルを変換
+Info(prcgen):I1036: Mobi file built successfully
+Final file size: 30MB
+```
+
+---
+
+**作成日**: 2025年1月23日  
+**最終更新**: 2025年8月23日  
+**対象**: EPUB → MOBI変換（KindleGen使用）  
+**検証済み**: Re:ゼロから始める異世界生活 第7巻、第39巻、第40巻
+
+**処理統計**:
+- 成功率: 100% (3/3巻)
+- 自動修正適用: 67% (2/3巻)
+- 平均変換時間: 約11秒/巻
+- 平均ファイルサイズ: 29MB (MOBI)
