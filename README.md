@@ -83,11 +83,11 @@ chmod +x epub_to_mobi_processor.sh
 ### ファイル例
 
 ```
-元ファイル: 現実主義勇者の王国再建記_02.epub
+元ファイル: hoge_02.epub
 ↓
 生成ファイル:
-├── 現実主義勇者の王国再建記_02.mobi              # Kindle用ファイル
-├── 現実主義勇者の王国再建記_02_KindleReady.epub  # 修正版EPUB
+├── hoge_02.mobi              # Kindle用ファイル
+├── hoge_02_KindleReady.epub  # 修正版EPUB
 └── epub_processing_20250123_143022.log           # 処理ログ
 ```
 
