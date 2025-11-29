@@ -39,7 +39,8 @@ KINDLEGEN_CMD="kindlegen"
 # 作業ディレクトリ
 WORK_DIR="$(pwd)/epub_work_$$"
 
-# ログファイル
+# ログファイル設定
+LOG_TO_FILE=false
 LOG_FILE="epub_processing_$(date +%Y%m%d_%H%M%S).log"
 
 # 結果用配列
@@ -59,7 +60,11 @@ EPUB_CONTENT_DIR=""
 log() {
     local message="$1"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" | tee -a "$LOG_FILE"
+    if [ "$LOG_TO_FILE" = true ]; then
+        echo "[$timestamp] $message" | tee -a "$LOG_FILE"
+    else
+        echo "[$timestamp] $message"
+    fi
 }
 
 log_error() {
@@ -290,6 +295,101 @@ fix_anchor_links_comprehensive() {
     log_info "XHTML内アンカーリンク修正完了"
 }
 
+# Pythonを使用してNCXファイルを検証・修正する関数
+fix_ncx_with_python() {
+    local ncx_file="$1"
+    
+    if [ ! -f "$ncx_file" ] || ! command -v python3 >/dev/null 2>&1; then 
+        return
+    fi
+    
+    log_info "Pythonを使用してNCXファイルを検証・修正中..."
+    
+    # Pythonスクリプトを一時ファイルとして作成
+    cat << 'EOF' > fix_ncx.py
+import xml.etree.ElementTree as ET
+import os
+import sys
+
+ncx_path = sys.argv[1]
+ncx_dir = os.path.dirname(ncx_path) or '.'
+modified = False
+
+try:
+    tree = ET.parse(ncx_path)
+    root = tree.getroot()
+
+    # 名前空間の取得
+    ns_url = ''
+    if '}' in root.tag:
+        ns_url = root.tag.split('}')[0].strip('{')
+    
+    ns = {'n': ns_url} if ns_url else {}
+    
+    # デフォルト名前空間を登録（出力時のプレフィックス防止）
+    if ns_url:
+        ET.register_namespace('', ns_url)
+
+    # navMapを探す
+    nav_map = root.find('n:navMap' if ns else 'navMap', ns)
+    if nav_map is None:
+        sys.exit(0)
+
+    # 再帰的にnavPointをチェックして削除する関数
+    def clean_navpoints(parent):
+        global modified
+        to_remove = []
+        
+        # 子navPointを取得
+        points = parent.findall('n:navPoint' if ns else 'navPoint', ns)
+        
+        for point in points:
+            # まず子要素を再帰的にチェック
+            clean_navpoints(point)
+            
+            # content要素をチェック
+            content = point.find('n:content' if ns else 'content', ns)
+            if content is not None:
+                src = content.get('src')
+                if src:
+                    file_path = src.split('#')[0] # アンカー除去
+                    full_path = os.path.join(ncx_dir, file_path)
+                    
+                    # ファイルが存在しない場合
+                    if not os.path.exists(full_path):
+                        print(f"Missing file reference in NCX: {file_path}")
+                        to_remove.append(point)
+                        modified = True
+        
+        # 削除実行
+        for p in to_remove:
+            parent.remove(p)
+
+    clean_navpoints(nav_map)
+
+    if modified:
+        tree.write(ncx_path, encoding='utf-8', xml_declaration=True)
+        print("NCX file updated.")
+    else:
+        print("No changes needed in NCX.")
+
+except Exception as e:
+    print(f"Error processing NCX: {e}")
+    sys.exit(1)
+EOF
+
+    # Pythonスクリプト実行
+    python3 fix_ncx.py "$ncx_file" | while read -r line; do
+        if [[ "$line" == "Missing"* ]]; then
+            log_warning "$line"
+        else
+            log_info "$line"
+        fi
+    done
+    
+    rm -f fix_ncx.py
+}
+
 # 存在しないファイルへの参照を検出・修正する新機能
 fix_missing_file_references() {
     log_info "存在しないファイル参照の検出・修正を実行中..."
@@ -312,34 +412,39 @@ fix_missing_file_references() {
         
         # 欠落ファイルの参照を削除
         if [ ${#missing_files[@]} -gt 0 ] 2>/dev/null; then
-        for missing_file in "${missing_files[@]}"; do
-            log_warning "存在しないファイル参照を削除: $missing_file"
-            local file_id=$(basename "$missing_file" .xhtml)
-            
-            # OPFファイルから該当行を削除（より安全な方法）
-            grep -v "href=\"$missing_file\"" "$EPUB_OPF_PATH" > "${EPUB_OPF_PATH}.tmp" && mv "${EPUB_OPF_PATH}.tmp" "$EPUB_OPF_PATH"
-            grep -v "idref=\"$file_id\"" "$EPUB_OPF_PATH" > "${EPUB_OPF_PATH}.tmp" && mv "${EPUB_OPF_PATH}.tmp" "$EPUB_OPF_PATH"
-            
-            # 目次ファイルからリンクを削除
-            find . -name "*.xhtml" -type f | while IFS= read -r xhtml_file; do
-                if grep -q "href=\"$missing_file" "$xhtml_file" 2>/dev/null; then
-                    grep -v "href=\"$missing_file" "$xhtml_file" > "${xhtml_file}.tmp" && mv "${xhtml_file}.tmp" "$xhtml_file"
-                fi
-                if grep -q "href=\"$(basename "$missing_file")" "$xhtml_file" 2>/dev/null; then
-                    grep -v "href=\"$(basename "$missing_file")" "$xhtml_file" > "${xhtml_file}.tmp" && mv "${xhtml_file}.tmp" "$xhtml_file"
+            for missing_file in "${missing_files[@]}"; do
+                log_warning "存在しないファイル参照を削除: $missing_file"
+                local file_id=$(basename "$missing_file" .xhtml)
+                
+                # OPFファイルから該当行を削除（より安全な方法）
+                grep -v "href=\"$missing_file\"" "$EPUB_OPF_PATH" > "${EPUB_OPF_PATH}.tmp" && mv "${EPUB_OPF_PATH}.tmp" "$EPUB_OPF_PATH"
+                grep -v "idref=\"$file_id\"" "$EPUB_OPF_PATH" > "${EPUB_OPF_PATH}.tmp" && mv "${EPUB_OPF_PATH}.tmp" "$EPUB_OPF_PATH"
+                
+                # 目次ファイルからリンクを削除
+                find . -name "*.xhtml" -type f | while IFS= read -r xhtml_file; do
+                    if grep -q "href=\"$missing_file" "$xhtml_file" 2>/dev/null; then
+                        grep -v "href=\"$missing_file" "$xhtml_file" > "${xhtml_file}.tmp" && mv "${xhtml_file}.tmp" "$xhtml_file"
+                    fi
+                    if grep -q "href=\"$(basename "$missing_file")" "$xhtml_file" 2>/dev/null; then
+                        grep -v "href=\"$(basename "$missing_file")" "$xhtml_file" > "${xhtml_file}.tmp" && mv "${xhtml_file}.tmp" "$xhtml_file"
+                    fi
+                done
+                
+                # ナビゲーションファイルからリンクを削除
+                if [ -f "item/navigation-documents.xhtml" ]; then
+                    grep -v "href=\"xhtml/$missing_file" "item/navigation-documents.xhtml" > "item/navigation-documents.xhtml.tmp" && mv "item/navigation-documents.xhtml.tmp" "item/navigation-documents.xhtml"
                 fi
             done
             
-            # ナビゲーションファイルからリンクを削除
-            if [ -f "item/navigation-documents.xhtml" ]; then
-                grep -v "href=\"xhtml/$missing_file" "item/navigation-documents.xhtml" > "item/navigation-documents.xhtml.tmp" && mv "item/navigation-documents.xhtml.tmp" "item/navigation-documents.xhtml"
-            fi
-        done
-        
             log_info "存在しないファイル参照の修正完了: ${#missing_files[@]}個のファイル参照を削除"
         else
-            log_info "すべてのファイル参照が正常です"
+            log_info "OPFファイル内のファイル参照は正常です"
         fi
+    fi
+    
+    # NCXファイルの修正（Pythonを使用）
+    if [ -n "$EPUB_NCX_PATH" ] && [ -f "$EPUB_NCX_PATH" ]; then
+        fix_ncx_with_python "$EPUB_NCX_PATH"
     fi
 }
 
@@ -384,15 +489,27 @@ rebuild_epub() {
     
     # ファイル一覧を確認
     log_info "ソースディレクトリ内ファイル:"
-    find . -type f | head -10 | sed 's/^/  /' | tee -a "$LOG_FILE"
+    if [ "$LOG_TO_FILE" = true ]; then
+        find . -type f | head -10 | sed 's/^/  /' | tee -a "$LOG_FILE"
+    else
+        find . -type f | head -10 | sed 's/^/  /'
+    fi
     
     # mimetypeファイルを最初に、無圧縮で追加
     if [ -f "mimetype" ]; then
         log_info "mimetypeファイルを追加中..."
-        if ! zip -0 -X "${abs_output_file}" mimetype 2>&1 | tee -a "$LOG_FILE"; then
-            log_error "mimetypeファイルの追加に失敗"
-            cd - > /dev/null
-            return 1
+        if [ "$LOG_TO_FILE" = true ]; then
+            if ! zip -0 -X "${abs_output_file}" mimetype 2>&1 | tee -a "$LOG_FILE"; then
+                log_error "mimetypeファイルの追加に失敗"
+                cd - > /dev/null
+                return 1
+            fi
+        else
+            if ! zip -0 -X "${abs_output_file}" mimetype; then
+                log_error "mimetypeファイルの追加に失敗"
+                cd - > /dev/null
+                return 1
+            fi
         fi
     else
         log_warning "mimetypeファイルが見つかりません"
@@ -400,10 +517,18 @@ rebuild_epub() {
     
     # 他のファイルを圧縮して追加
     log_info "その他のファイルを追加中..."
-    if ! zip -r "${abs_output_file}" . -x "mimetype" "*.DS_Store" ".*" 2>&1 | tee -a "$LOG_FILE"; then
-        log_error "ファイルの追加に失敗"
-        cd - > /dev/null
-        return 1
+    if [ "$LOG_TO_FILE" = true ]; then
+        if ! zip -r "${abs_output_file}" . -x "mimetype" "*.DS_Store" ".*" "*.log" 2>&1 | tee -a "$LOG_FILE"; then
+            log_error "ファイルの追加に失敗"
+            cd - > /dev/null
+            return 1
+        fi
+    else
+        if ! zip -r "${abs_output_file}" . -x "mimetype" "*.DS_Store" ".*" "*.log"; then
+            log_error "ファイルの追加に失敗"
+            cd - > /dev/null
+            return 1
+        fi
     fi
     
     cd - > /dev/null
@@ -446,14 +571,22 @@ convert_to_mobi() {
     # 出力内容を解析して実際の成功・失敗を判定
     log_info "KindleGen出力解析中（終了コード: ${exit_code}）..."
     log_info "出力の最後10行:"
-    echo "$output" | tail -10 | sed 's/^/    /' | tee -a "$LOG_FILE"
+    if [ "$LOG_TO_FILE" = true ]; then
+        echo "$output" | tail -10 | sed 's/^/    /' | tee -a "$LOG_FILE"
+    else
+        echo "$output" | tail -10 | sed 's/^/    /'
+    fi
     
     if echo "$output" | grep -q "PRC built successfully\|Mobi file built successfully" 2>/dev/null; then
         # 成功パターン
         if echo "$output" | grep -q "WARNINGS" 2>/dev/null; then
             log_success "MOBI変換成功（警告あり）: $epub_name"
             log_warning "KindleGen警告:"
-            echo "$output" | grep -E "Warning|W[0-9]+" | sed 's/^/    /' | tee -a "$LOG_FILE"
+            if [ "$LOG_TO_FILE" = true ]; then
+                echo "$output" | grep -E "Warning|W[0-9]+" | sed 's/^/    /' | tee -a "$LOG_FILE"
+            else
+                echo "$output" | grep -E "Warning|W[0-9]+" | sed 's/^/    /'
+            fi
         else
             log_success "MOBI変換成功: $epub_name"
         fi
@@ -477,7 +610,11 @@ convert_to_mobi() {
         # 明確な失敗パターン
         log_error "MOBI変換失敗: $epub_name"
         log_error "KindleGenエラー出力:"
-        echo "$output" | sed 's/^/    /' | tee -a "$LOG_FILE"
+        if [ "$LOG_TO_FILE" = true ]; then
+            echo "$output" | sed 's/^/    /' | tee -a "$LOG_FILE"
+        else
+            echo "$output" | sed 's/^/    /'
+        fi
         ERROR_FILES+=("$epub_name")
         return 1
         
@@ -490,7 +627,11 @@ convert_to_mobi() {
         else
             log_error "MOBI変換失敗: $epub_name"
             log_error "KindleGenエラー出力:"
-            echo "$output" | sed 's/^/    /' | tee -a "$LOG_FILE"
+            if [ "$LOG_TO_FILE" = true ]; then
+                echo "$output" | sed 's/^/    /' | tee -a "$LOG_FILE"
+            else
+                echo "$output" | sed 's/^/    /'
+            fi
             ERROR_FILES+=("$epub_name")
             return 1
         fi
@@ -607,7 +748,11 @@ show_summary() {
     fi
     
     log_info "作成されたファイル:"
-    ls -lah *.mobi 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}' | tee -a "$LOG_FILE"
+    if [ "$LOG_TO_FILE" = true ]; then
+        ls -lah *.mobi 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}' | tee -a "$LOG_FILE"
+    else
+        ls -lah *.mobi 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}'
+    fi
     
     # 中間EPUBファイルは削除されるため表示しない
     # if ls *_KindleReady.epub >/dev/null 2>&1; then
@@ -635,6 +780,7 @@ EPUB→MOBI変換統合スクリプト
 
 オプション:
     -h, --help        このヘルプメッセージを表示
+    -l, --log         ログファイルを出力する（デフォルトは出力なし）
 
 機能:
     1. EPUBファイルの構造検証
@@ -644,40 +790,63 @@ EPUB→MOBI変換統合スクリプト
 
 実行例:
     ./epub_to_mobi_processor.sh                    # スクリプトと同じディレクトリのEPUBを処理
+    ./epub_to_mobi_processor.sh -l                 # ログファイルを出力して処理
     ./epub_to_mobi_processor.sh /path/to/epub      # 指定ディレクトリのEPUBを処理
-    ./epub_to_mobi_processor.sh ~/Documents/Books  # ホームディレクトリのBooksフォルダを処理
 
 出力ファイル:
     ・MOBIファイル: [元ファイル名].mobi
-    ・ログファイル: epub_processing_YYYYMMDD_HHMMSS.log
+    ・ログファイル: epub_processing_YYYYMMDD_HHMMSS.log (オプション指定時のみ)
     
     注意: 修正版EPUB（_KindleReady.epub）は処理完了後に自動削除されます
 EOF
 }
 
 main() {
-    # ヘルプオプション確認
-    if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
-        show_help
-        exit 0
-    fi
-    
     # 引数処理
-    local target_dir="${1:-$DEFAULT_TARGET_DIR}"
+    local target_dir=""
     
-    log_info "======================================"
-    log_info "EPUB→MOBI変換処理 開始"
-    log_info "======================================"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -l|--log)
+                LOG_TO_FILE=true
+                shift
+                ;;
+            *)
+                if [ -z "$target_dir" ]; then
+                    target_dir="$1"
+                else
+                    echo "エラー: 複数のディレクトリ指定はサポートされていません"
+                    show_help
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
     
-    # 引数の指定有無を明確に表示
-    if [ $# -eq 0 ]; then
+    # 対象ディレクトリが未指定の場合はデフォルトを使用
+    if [ -z "$target_dir" ]; then
+        target_dir="$DEFAULT_TARGET_DIR"
         log_info "対象ディレクトリ: $target_dir (スクリプト設置ディレクトリ)"
     else
         log_info "対象ディレクトリ: $target_dir (引数指定)"
     fi
     
+    log_info "======================================"
+    log_info "EPUB→MOBI変換処理 開始"
+    log_info "======================================"
+    
+    if [ "$LOG_TO_FILE" = true ]; then
+        log_info "ログ出力: 有効 ($LOG_FILE)"
+    else
+        log_info "ログ出力: 無効"
+    fi
+    
     log_info "作業ディレクトリ: $WORK_DIR"
-    log_info "ログファイル: $LOG_FILE"
     log_info ""
     
     # ディレクトリ存在確認

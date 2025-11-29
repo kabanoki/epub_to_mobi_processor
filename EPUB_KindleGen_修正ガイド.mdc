@@ -55,8 +55,9 @@ in file: /path/to/item/xhtml/p-006.xhtml
 **原因:** 
 - OPFファイル、目次、ナビゲーションファイルで参照されているファイルが実際には存在しない
 - 欠落したコンテンツファイル（例：p-006.xhtml）への参照が残っている
+- `toc.ncx`（目次ファイル）に、削除されたファイルへのリンクが残っている（KindleGenエラー E24010の原因）
 
-**自動解決:** `epub_to_mobi_processor.sh`の`fix_missing_file_references()`機能で自動修正
+**自動解決:** `epub_to_mobi_processor.sh`の`fix_missing_file_references()`機能で自動修正（v1.1.0以降はPythonを使用してNCXファイルも詳細に修正）
 
 **手動解決方法:**
 ```bash
