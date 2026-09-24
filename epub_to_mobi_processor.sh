@@ -7,7 +7,8 @@
 # 1. EPUBファイルの構造検証
 # 2. 包括的エラー修正 (HTML→XHTML変換、アンカーリンク修正等)
 # 3. KindleGenによるMOBI変換
-# 4. 詳細なログ出力とエラーレポート
+# 4. Kindle接続時のMOBI自動転送
+# 5. 詳細なログ出力とエラーレポート
 #
 # 使用方法: 
 # ./epub_to_mobi_processor.sh [対象ディレクトリ]
@@ -36,8 +37,8 @@ DEFAULT_TARGET_DIR="$SCRIPT_DIR"
 # kindlegen実行パス
 KINDLEGEN_CMD="kindlegen"
 
-# 作業ディレクトリ
-WORK_DIR="$(pwd)/epub_work_$$"
+# 作業ディレクトリ（対象ディレクトリ確定後に設定）
+WORK_DIR=""
 
 # ログファイル設定
 LOG_TO_FILE=false
@@ -85,6 +86,72 @@ log_info() {
 log_warning() {
     local message="$1"
     log "⚠️  WARNING: $message"
+}
+
+find_kindle_documents_dir() {
+    local mount_point
+    local volume_name
+    local lower_volume_name
+    local documents_dir
+
+    for mount_point in /Volumes/* /media/"${USER:-}"/* /run/media/"${USER:-}"/*; do
+        [ -d "$mount_point" ] || continue
+
+        volume_name="$(basename "$mount_point")"
+        lower_volume_name="$(printf '%s' "$volume_name" | tr '[:upper:]' '[:lower:]')"
+
+        if [[ "$lower_volume_name" == kindle* ]]; then
+            for documents_dir in "$mount_point/documents" "$mount_point/Documents"; do
+                if [ -d "$documents_dir" ]; then
+                    printf '%s\n' "$documents_dir"
+                    return 0
+                fi
+            done
+        fi
+    done
+
+    return 1
+}
+
+transfer_mobi_to_kindle_if_connected() {
+    local mobi_file="$1"
+    local kindle_documents_dir
+    local kindle_target_file
+
+    if [ ! -f "$mobi_file" ]; then
+        log_warning "Kindle転送をスキップしました（MOBIファイルが見つかりません）: $mobi_file"
+        return 0
+    fi
+
+    if ! kindle_documents_dir="$(find_kindle_documents_dir)"; then
+        log_info "Kindle未接続のためMOBI自動転送をスキップ: $(basename "$mobi_file")"
+        return 0
+    fi
+
+    kindle_target_file="$kindle_documents_dir/$(basename "$mobi_file")"
+    if cp -p "$mobi_file" "$kindle_target_file"; then
+        log_success "KindleへMOBI転送完了: $(basename "$mobi_file") → $kindle_documents_dir"
+    else
+        log_warning "KindleへのMOBI転送に失敗: $(basename "$mobi_file") → $kindle_documents_dir"
+    fi
+}
+
+normalize_mobi_output_file() {
+    local epub_file="$1"
+    local epub_name="$2"
+    local generated_mobi="${epub_file%.epub}.mobi"
+    local target_mobi="${epub_name}.mobi"
+
+    FINAL_MOBI_FILE="$target_mobi"
+
+    if [ -f "$generated_mobi" ] && [ "$generated_mobi" != "$target_mobi" ]; then
+        if mv "$generated_mobi" "$target_mobi"; then
+            log_info "MOBIファイルをリネーム: $(basename "$generated_mobi") → $(basename "$target_mobi")"
+        else
+            log_warning "MOBIファイルのリネームに失敗: $generated_mobi"
+            FINAL_MOBI_FILE="$generated_mobi"
+        fi
+    fi
 }
 
 cleanup() {
@@ -212,7 +279,10 @@ fix_epub_structure() {
     
     # ステップ4: 包括的アンカーリンク修正
     fix_anchor_links_comprehensive
-    
+
+    # ステップ4.5: リンク先に存在しないアンカーの除去
+    fix_unresolved_anchors
+
     # ステップ5: 文字エンコーディング確認
     verify_encoding
     
@@ -277,6 +347,7 @@ fix_anchor_links_comprehensive() {
         for pattern in "${patterns[@]}"; do
             sed -i '' "$pattern" "$EPUB_NCX_PATH"
         done
+        sed -i '' -E 's/(<content src="[^"#]+\.xhtml)#[^"]*"/\1"/g' "$EPUB_NCX_PATH"
         log_info "$EPUB_NCX_PATH のアンカーリンク修正完了"
     fi
     
@@ -293,6 +364,74 @@ fix_anchor_links_comprehensive() {
         find . -name "*.xhtml" -exec sed -i '' "$pattern" {} \;
     done
     log_info "XHTML内アンカーリンク修正完了"
+}
+
+# リンク先ファイルに該当IDが存在しないアンカー(#xxx)を除去し、ファイル先頭へのリンクにする
+# （KindleGen E24010「Hyperlink not resolved in toc」対策）
+fix_unresolved_anchors() {
+    log_info "未解決アンカーリンクの検出・修正を実行中..."
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_warning "python3が見つからないため未解決アンカー修正をスキップします"
+        return
+    fi
+
+    local output
+    set +e
+    output=$(python3 - . << 'EOF' 2>&1
+import os, re, sys
+from urllib.parse import unquote
+
+root = sys.argv[1]
+link_re = re.compile(r'((?:href|src)=")([^"#:]*)#([^"]+)(")')
+ids_cache = {}
+
+def ids_of(path):
+    if path not in ids_cache:
+        try:
+            with open(path, encoding='utf-8', errors='ignore') as f:
+                ids_cache[path] = set(re.findall(r'\b(?:id|name)="([^"]+)"', f.read()))
+        except OSError:
+            ids_cache[path] = None
+    return ids_cache[path]
+
+for dirpath, _, files in os.walk(root):
+    for name in files:
+        if not name.endswith(('.xhtml', '.ncx')):
+            continue
+        path = os.path.join(dirpath, name)
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+
+        def repl(m):
+            target = m.group(2)
+            target_path = os.path.normpath(os.path.join(dirpath, unquote(target))) if target else path
+            ids = ids_of(target_path)
+            if ids is None or unquote(m.group(3)) in ids:
+                return m.group(0)
+            print(f"Unresolved anchor: {os.path.relpath(path, root)} -> {target or name}#{m.group(3)}")
+            return m.group(1) + (target or name) + m.group(4)
+
+        new_text = link_re.sub(repl, text)
+        if new_text != text:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_text)
+EOF
+)
+    set -e
+
+    local count=0
+    while read -r line; do
+        [ -n "$line" ] || continue
+        if [[ "$line" == "Unresolved anchor:"* ]]; then
+            log_warning "アンカー除去 ${line#Unresolved anchor: }"
+            ((count++)) || true
+        else
+            log_warning "$line"
+        fi
+    done <<< "$output"
+
+    log_info "未解決アンカーリンク修正完了: ${count}件"
 }
 
 # Pythonを使用してNCXファイルを検証・修正する関数
@@ -379,15 +518,29 @@ except Exception as e:
 EOF
 
     # Pythonスクリプト実行
-    python3 fix_ncx.py "$ncx_file" | while read -r line; do
+    local output
+    local exit_code
+    set +e
+    output=$(python3 fix_ncx.py "$ncx_file" 2>&1)
+    exit_code=$?
+    set -e
+
+    while read -r line; do
+        [ -n "$line" ] || continue
         if [[ "$line" == "Missing"* ]]; then
+            log_warning "$line"
+        elif [[ "$line" == "Error processing NCX:"* ]]; then
             log_warning "$line"
         else
             log_info "$line"
         fi
-    done
+    done <<< "$output"
     
     rm -f fix_ncx.py
+
+    if [ "$exit_code" -ne 0 ]; then
+        log_warning "NCXファイルのPython修正に失敗しました。MOBI変換は継続します: $ncx_file"
+    fi
 }
 
 # 存在しないファイルへの参照を検出・修正する新機能
@@ -591,17 +744,8 @@ convert_to_mobi() {
             log_success "MOBI変換成功: $epub_name"
         fi
         
-        # 生成されたMOBIファイルを元のEPUBファイル名に合わせてリネーム
-        local generated_mobi="${epub_file%.epub}.mobi"
-        local target_mobi="${epub_name}.mobi"
-        
-        if [ -f "$generated_mobi" ] && [ "$generated_mobi" != "$target_mobi" ]; then
-            if mv "$generated_mobi" "$target_mobi"; then
-                log_info "MOBIファイルをリネーム: $(basename "$generated_mobi") → $(basename "$target_mobi")"
-            else
-                log_warning "MOBIファイルのリネームに失敗: $generated_mobi"
-            fi
-        fi
+        normalize_mobi_output_file "$epub_file" "$epub_name"
+        transfer_mobi_to_kindle_if_connected "$FINAL_MOBI_FILE"
         
         SUCCESS_FILES+=("$epub_name")
         return 0
@@ -622,6 +766,8 @@ convert_to_mobi() {
         # 判定困難な場合は終了コードで判定
         if [ ${exit_code} -eq 0 ]; then
             log_success "MOBI変換成功: $epub_name"
+            normalize_mobi_output_file "$epub_file" "$epub_name"
+            transfer_mobi_to_kindle_if_connected "$FINAL_MOBI_FILE"
             SUCCESS_FILES+=("$epub_name")
             return 0
         else
@@ -786,7 +932,8 @@ EPUB→MOBI変換統合スクリプト
     1. EPUBファイルの構造検証
     2. 包括的エラー修正（HTML→XHTML変換、アンカーリンク修正等）
     3. KindleGenによるMOBI変換
-    4. 詳細なログ出力とエラーレポート
+    4. Kindle接続時のMOBI自動転送
+    5. 詳細なログ出力とエラーレポート
 
 実行例:
     ./epub_to_mobi_processor.sh                    # スクリプトと同じディレクトリのEPUBを処理
@@ -797,6 +944,7 @@ EPUB→MOBI変換統合スクリプト
     ・MOBIファイル: [元ファイル名].mobi
     ・ログファイル: epub_processing_YYYYMMDD_HHMMSS.log (オプション指定時のみ)
     
+    Kindleが接続されている場合は、生成されたMOBIファイルをKindleのdocumentsフォルダへ自動転送します
     注意: 修正版EPUB（_KindleReady.epub）は処理完了後に自動削除されます
 EOF
 }
@@ -846,14 +994,16 @@ main() {
         log_info "ログ出力: 無効"
     fi
     
-    log_info "作業ディレクトリ: $WORK_DIR"
-    log_info ""
-    
     # ディレクトリ存在確認
     if [ ! -d "$target_dir" ]; then
         log_error "対象ディレクトリが存在しません: $target_dir"
         exit 1
     fi
+
+    target_dir="$(cd "$target_dir" && pwd)"
+    WORK_DIR="$target_dir/epub_work_$$"
+    log_info "作業ディレクトリ: $WORK_DIR"
+    log_info ""
     
     # kindlegen実行確認
     if ! command -v "$KINDLEGEN_CMD" >/dev/null 2>&1; then
@@ -869,8 +1019,15 @@ main() {
     cd "$target_dir"
     
     # EPUBファイル検索
-    local epub_files=(*.epub)
-    if [ ! -f "${epub_files[0]}" ]; then
+    local all_epub_files=(*.epub)
+    local epub_files=()
+    for epub in "${all_epub_files[@]}"; do
+        [ -f "$epub" ] || continue
+        [[ "$epub" == *_KindleReady.epub ]] && continue
+        epub_files+=("$epub")
+    done
+
+    if [ ${#epub_files[@]} -eq 0 ]; then
         log_error "EPUBファイルが見つかりません: $target_dir"
         exit 1
     fi
